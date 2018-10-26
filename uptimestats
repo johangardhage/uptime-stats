@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+#
+# Script for generating uptime statistics
+#
+# Author: Johan Gardhage <johan.gardhage@gmail.com>
+#
+
+import datetime
+from systemd import journal
+
+def collectEvents():
+    j = journal.Reader(journal.SYSTEM)
+    j.this_boot(None)
+    j.add_conjunction()
+    j.log_level(journal.LOG_DEBUG)
+
+    try:
+        bootTime = j.get_next()['__REALTIME_TIMESTAMP']
+    except KeyError:
+        print("Warning: no entries in the Journal found for boot (script terminated)\n")
+        sys.exit(1)
+
+    msgSuspendStart = "Reached target Sleep."
+    msgHibernateStart = "Suspending system..."
+    msgSuspendWake = "ACPI: Waking up from system sleep state S3"
+    msgHibernateWake = "ACPI: Waking up from system sleep state S4"
+    msgShuttingDown = "Shutting down."
+
+    j.add_match("MESSAGE=" + msgHibernateStart)
+    j.add_disjunction()
+    j.add_match("MESSAGE=" + msgSuspendStart)
+    j.add_disjunction()
+    j.add_match("MESSAGE=" + msgHibernateWake)
+    j.add_disjunction()
+    j.add_match("MESSAGE=" + msgSuspendWake)
+    j.add_disjunction()
+    j.add_match("MESSAGE=" + msgShuttingDown)
+
+    wakeupTime = bootTime
+    sleepTime = None
+    wakeupType = "S5 (boot)"
+
+    # An array of [(wakeupTime, sleepTime, wakeupType), ...]
+    events = []
+
+    for event in j:
+        try:
+            msg = str(event['MESSAGE'])
+        except:
+            continue
+
+        if msgSuspendStart in msg or msgHibernateStart in msg or msgShuttingDown in msg:
+            sleepTime = event['__REALTIME_TIMESTAMP']
+        elif (msgSuspendWake in msg or msgHibernateWake in msg) and sleepTime is not None:
+            events.append((wakeupTime, sleepTime, wakeupType))
+
+            wakeupTime = event['__REALTIME_TIMESTAMP']
+            sleepTime = None
+            if msgSuspendWake in msg:
+                wakeupType = "S3 (RAM)"
+            elif msgHibernateWake in msg:
+                wakeupType = "S4 (disk)"
+
+    # Append the last wakeUp with the sleepTime (might be None if still awake)
+    events.append((wakeupTime, sleepTime, wakeupType))
+
+    j.close()
+    return events
+
+def calculateTimeDifference(awakeTime, sleepTime):
+    awakeTotal = (sleepTime - awakeTime).total_seconds()
+    awakeFractionalDays = float(awakeTotal / 86400)
+    awakeHours = int(awakeTotal // 3600)
+    awakeMinutes = int((awakeTotal % 3600) // 60)
+    awakeSeconds = int(awakeTotal % 60)
+    return [awakeFractionalDays, awakeHours, awakeMinutes, awakeSeconds]
+
+def printStatistics(events):
+    headers = ["Wakeup Timestamp", "Sleep Timestamp", "Awake Time", "Wakeup From"]
+    rowSeparator = ("-" * 19, "-" * 19, "-" * 10, "-" * 11)
+    rowFormat = " {:^19} |" + " {:^19} |" + " {:^10} |" + " {:^11}"
+    timeFormat = "%Y-%m-%d %H:%M:%S"
+    awakeTimeFormat = "{:3d}h {:2d}m"
+
+    totalDaysAwake = 0
+    bootTime = events[0][0]
+    currentTime = datetime.datetime.now()
+    timeSinceBoot = calculateTimeDifference(bootTime, currentTime)
+
+    print("Initial Boot Timestamp: {}\n".format(bootTime.strftime(timeFormat)))
+    print(rowFormat.format(*headers))
+    print(rowFormat.format(*rowSeparator))
+    for event in events:
+        [wakeupTime, sleepTime, wakeupType] = event
+        if sleepTime is None:
+            sleepTime = currentTime
+            sleepTimeFormat = '(Still Awake)'
+        else:
+            sleepTimeFormat = timeFormat
+        awakeTime = calculateTimeDifference(wakeupTime, sleepTime)
+        totalDaysAwake = totalDaysAwake + awakeTime[0]
+        print(rowFormat.format(wakeupTime.strftime(timeFormat), sleepTime.strftime(sleepTimeFormat), awakeTimeFormat.format(awakeTime[1], awakeTime[2]), wakeupType))
+    print(rowFormat.format(*rowSeparator))
+    print("\nDays Since Boot: {:.2f} - Days Awake: {:.2f} - Wake/Sleep Cycles: {}".format(timeSinceBoot[0], totalDaysAwake, len(events) - 1))
+
+# Main Program
+if __name__ == "__main__":
+    events = collectEvents()
+    printStatistics(events)
